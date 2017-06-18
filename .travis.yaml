@@ -1,0 +1,21 @@
+go_import_path: github.com/container-storage-interface/examples
+
+language: go
+
+go:
+  - 1.8.x
+
+before_install:
+  - curl -LO https://github.com/google/protobuf/releases/download/v3.3.0/protoc-3.3.0-linux-x86_64.zip
+  - unzip protoc-3.3.0-linux-x86_64.zip
+  - chmod +x bin/protoc
+  - export PATH="$(pwd)/bin:$PATH"
+
+install:
+  - go get -u github.com/golang/protobuf/proto
+  - go get -u github.com/golang/protobuf/protoc-gen-go
+  - go get -u google.golang.org/grpc
+  - make -C gocsi csi/csi.pb.go
+
+script:
+  - make -C gocsi
