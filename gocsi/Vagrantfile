@@ -1,0 +1,240 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+require 'fileutils'
+require 'shellwords'
+require 'fog'
+
+# general config
+$autostart_clients = true # set to false to prevent clients from auto-starting
+
+# aws config
+$aws_ami  = ENV['AWS_AMI']  ? ENV['AWS_AMI'] : "ami-f4533694"
+$aws_akey = ENV['AWS_ACCESS_KEY_ID']
+$aws_skey = ENV['AWS_SECRET_ACCESS_KEY']
+$aws_kpnm = ENV['AWS_KEY_PAIR_NAME']
+$aws_regn = ENV['AWS_DEFAULT_REGION'] ? ENV['AWS_DEFAULT_REGION'] : "us-west-2"
+$aws_zone = ENV['AWS_DEFAULT_ZONE'] ? ENV['AWS_DEFAULT_ZONE'] : "a"
+
+# ssh config
+$ssh_user    = "centos"
+$ssh_pkey    = ENV['AWS_SSHK'] # path to SSH private key for AWS
+
+# node0_info
+$node0_name =       "gocsi"
+$node0_itype =      "m4.large"
+
+# provision protoc
+$provision_protoc = <<SCRIPT
+curl -LO https://github.com/google/protobuf/releases/download/v3.3.0/protoc-3.3.0-linux-x86_64.zip
+unzip protoc-3.3.0-linux-x86_64.zip
+chmod +x bin/protoc
+cp -f bin/protoc /usr/local/bin/
+SCRIPT
+
+# Golang information
+$goos   = "linux"
+$goarch = "amd64"
+$gover  = "1.8.3"
+$gotgz  = "go#{$gover}.#{$goos}-#{$goarch}.tar.gz"
+$gourl  = "https://storage.googleapis.com/golang/#{$gotgz}"
+$gopath = "/go"
+
+# the script to provision golang
+$provision_golang = <<SCRIPT
+echo installing go#{$gover}.#{$goos}-#{$goarch}
+curl -SL #{$gourl.shellescape} | tar -C /usr/local -xz
+mkdir -p #{$gopath.shellescape}
+rm -f #{$gotgz.shellescape}
+SCRIPT
+
+# the script to provision an update to the system
+$provision_update_system = <<SCRIPT
+yum update -y
+SCRIPT
+
+# the script to install build tools
+$provision_build_tools = <<SCRIPT
+yum group install -y "Development Tools"
+yum install -y glibc-static glibc-devel.i686
+SCRIPT
+
+# the script to install git on the clients
+$provision_git = <<SCRIPT
+yum install -y git
+SCRIPT
+
+# the script to update the root profile with go info
+$to_root_profile = ">> /root/.bash_profile"
+$update_root_profile_with_go_info = <<SCRIPT
+echo export GOPATH=#{$gopath} #{$to_root_profile}
+echo export PATH=#{$gopath}/bin:/usr/local/go/bin:$PATH #{$to_root_profile}
+SCRIPT
+
+# the info and script to provision, update, and build gocsi
+$csi_examples  = "github.com/container-storage-interface/examples"
+$gocsi_owner   = "akutz"
+$gocsi_repo    = "csi-examples"
+$gocsi_ref     = "feature/gocsi"
+$gocsi_uri     = "https://github.com/#{$gocsi_owner}/#{$gocsi_repo}"
+$gocsi_src     = "#{$gopath}/src/#{$csi_examples}"
+
+$provision_gocsi = <<SCRIPT
+mkdir -p "#{$gocsi_src}"
+cd "#{$gocsi_src}"
+git clone "#{$gocsi_uri}" .
+git checkout "#{$gocsi_ref}" || true
+SCRIPT
+
+$update_gocsi = <<SCRIPT
+cd "#{$gocsi_src}"
+git fetch
+git reset --hard @{u} || true
+SCRIPT
+
+$build_gocsi = <<SCRIPT
+cd "#{$gocsi_src}"
+make -C gocsi
+SCRIPT
+
+$goarch = "amd64"
+$gover  = "1.8.3"
+$gotgz  = "go#{$gover}.#{$goos}-#{$goarch}.tar.gz"
+$gourl  = "https://storage.googleapis.com/golang/#{$gotgz}"
+$gopath = "/go"
+
+# init the environment variables used when building go source
+$build_env_vars = Hash[
+    "GOPATH" => $gopath.shellescape,
+    "PATH" => "#{$gopath.shellescape}/bin:/usr/local/go/bin:$PATH"
+]
+
+# node_dir returns the directory for a given node
+def node_dir(name)
+    return "#{File.dirname(__FILE__)}/.vagrant/machines/#{name}"
+end
+
+# is_first_up returns a flag indicating whether or not this is the first time
+# 'vagrant up' has been called on a specific node
+def is_first_up(name)
+  return Dir.glob("#{node_dir(name)}/aws/id").empty?
+end
+
+# init_aws initializes the aws config
+def init_aws(aws, name, instance_type)
+  aws.ami =                       $aws_ami
+  aws.access_key_id =             $aws_akey
+  aws.secret_access_key =         $aws_skey
+  aws.keypair_name =              $aws_kpnm
+  aws.region =                    $aws_regn
+  aws.availability_zone =         "#{$aws_regn}#{$aws_zone}"
+  aws.instance_type =             instance_type
+  aws.terminate_on_shutdown =     true
+  aws.unregister_elb_from_az =    true
+  aws.tags =                      {"Name" => name}
+end
+
+# init_node initializes the node information
+def init_node(node, name)
+  node.vm.hostname = name
+end
+
+# machine_id gets the aws machine id from a node name
+def machine_id(name)
+  id_file="#{File.dirname(__FILE__)}/.vagrant/machines/#{name}/aws/id"
+  return File.exists?(id_file) ? File.read(id_file) : nil
+end
+
+# aws cnxn to use to get machines' private ips for hostname resolution
+$aws_cnxn =   Fog::Compute.new(
+    :provider => :aws,
+    :region => $aws_regn,
+    :aws_access_key_id => $aws_akey,
+    :aws_secret_access_key => $aws_skey)
+
+Vagrant.configure("2") do |config|
+  config.vm.box =               "dummy"
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.ssh.username =         $ssh_user
+  config.ssh.private_key_path = $ssh_pkey
+
+  # don't modify the host, only guests
+  config.hostmanager.enabled =           true
+  config.hostmanager.manage_host =       false
+  config.hostmanager.manage_guest =      true
+  config.hostmanager.include_offline =   true
+  config.hostmanager.ignore_private_ip = false
+  config.hostmanager.ip_resolver = proc do |vm, resolving_vm|
+    if mid = machine_id(vm.name)
+      $aws_cnxn.servers.get(mid).private_ip_address
+    end
+  end
+
+  # configure node0
+  config.vm.define $node0_name do |node|
+
+    # initialize the node information
+    init_node node, $node0_name
+
+    # initialize the aws config
+    node.vm.provider :aws do |aws|
+      init_aws aws, $node0_name, $node0_itype
+    end
+
+    # only proceed if this is the first time 'vagrant up' has been called
+    # on this node
+    if is_first_up $node0_name
+
+      # update system
+      node.vm.provision "shell" do |s|
+        s.name =   "update-system"
+        s.inline = $provision_update_system
+      end
+
+      # install build tools
+      node.vm.provision "shell" do |s|
+        s.name =   "build-tools"
+        s.inline = $provision_build_tools
+      end
+
+      # provision protoc
+      node.vm.provision "shell" do |s|
+        s.name   = "protoc"
+        s.inline = $provision_protoc
+      end
+
+      # provision golang
+      node.vm.provision "shell" do |s|
+        s.name   = "golang"
+        s.inline = $provision_golang
+      end
+
+      # update root profile with go info
+      node.vm.provision "shell" do |s|
+        s.name   = "update root profile"
+        s.inline = $update_root_profile_with_go_info
+      end
+
+      # provision gocsi
+      node.vm.provision "shell" do |s|
+        s.name   = "provision gocsi"
+        s.inline = $provision_gocsi
+      end
+
+    end # if is_first_up node.vm.hostname
+
+    # update gocsi
+    node.vm.provision "shell" do |s|
+      s.name   = "update gocsi"
+      s.inline = $update_gocsi
+    end
+
+    # build gocsi
+    node.vm.provision "shell" do |s|
+      s.name   = "build gocsi"
+      s.inline = $build_gocsi
+    end
+
+  end # configure node0
+
+end

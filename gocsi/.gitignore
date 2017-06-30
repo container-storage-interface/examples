@@ -1,0 +1,5 @@
+.build/
+.DS_Store
+csd.log
+mock.so
+.vagrant/
